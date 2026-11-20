@@ -1,0 +1,14 @@
+.cello/
+.cello-setup-*/
+.venv/
+.env
+.DS_Store
+__pycache__/
+*.py[cod]
+data/
+outputs/
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+*.log

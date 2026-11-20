@@ -1,0 +1,685 @@
+diff --git a/cello/dataset.py b/cello/dataset.py
+index f4e541d..41e028e 100644
+--- a/cello/dataset.py
++++ b/cello/dataset.py
+@@ -7,8 +7,8 @@ whose centroid falls inside the tile:
+     X      : (n_cells, n_panel_genes) float32, log1p(normalize_total(counts, 100))
+     genes  : (n_panel_genes,) str, the sample's Xenium panel
+ 
+-Expression is scattered into the union gene vocabulary; genes that are not on
+-a sample's panel stay zero and are excluded from the loss (see ``model.py``).
++Expression is scattered into the union gene vocabulary; absent columns stay zero. The public model uses a batch-global nonzero-target
++gene mask, not a per-cell physical availability mask.
+ """
+ 
+ import os
+@@ -42,11 +42,14 @@ def to_tensor(img: Image.Image) -> torch.Tensor:
+ def augment_image_and_positions(img: torch.Tensor, rel_xy: torch.Tensor, size: int):
+     """Random horizontal / vertical flips (cell coordinates flipped accordingly)
+     and mild brightness / contrast jitter. Training split only."""
++    sign=torch.ones(2)
+     if random.random() < 0.5:
++        sign[0]=-1
+         img = TF.hflip(img)
+         rel_xy = rel_xy.clone()
+         rel_xy[:, 0] = (size - 1) - rel_xy[:, 0]
+     if random.random() < 0.5:
++        sign[1]=-1
+         img = TF.vflip(img)
+         rel_xy = rel_xy.clone()
+         rel_xy[:, 1] = (size - 1) - rel_xy[:, 1]
+@@ -55,7 +58,7 @@ def augment_image_and_positions(img: torch.Tensor, rel_xy: torch.Tensor, size: i
+         pil = TF.adjust_brightness(pil, 0.9 + 0.2 * random.random())
+         pil = TF.adjust_contrast(pil, 0.9 + 0.2 * random.random())
+         img = TF.to_tensor(pil)
+-    return img, rel_xy
++    return img, rel_xy, sign
+ 
+ 
+ def is_foreground_tile(img_uint8: np.ndarray, lo=10, hi=250, min_std=5) -> bool:
+@@ -84,6 +87,7 @@ def collate_fn(batch):
+         "img": imgs,
+         "cell_xy": cell_xy_pad,
+         "genes_target": genes_target_pad,
++        "target_available": torch.stack([b["target_available"] for b in batch]),
+         "cell_mask": cell_mask,
+         "n_cells": n_cells,
+         "S_genes": batch[0]["S_genes"],
+@@ -138,7 +142,7 @@ class PatchDataset(Dataset):
+     """
+ 
+     def __init__(self, index_df: pd.DataFrame, union_genes: List[str], img_size: int = 224,
+-                 max_cells_per_patch: Optional[int] = 256, augment: bool = False):
++                 max_cells_per_patch: Optional[int] = 256, augment: bool = False, halo_pixels: int = 0):
+         self.df = index_df.reset_index(drop=True)
+         self.union_genes = list(union_genes)
+         self.n_genes = len(self.union_genes)
+@@ -146,6 +150,9 @@ class PatchDataset(Dataset):
+         self.img_size = img_size
+         self.max_cells_per_patch = max_cells_per_patch
+         self.augment = augment
++        self.halo_pixels = int(halo_pixels)
++        if self.halo_pixels:
++            raise ValueError("Use 224-pixel tiles with halo_pixels: 0.")
+         self.img_paths = self.df["img_path"].values
+         self.npz_paths = self.df["npz_path"].values
+         self.patients = self.df["patient"].astype(str).values
+@@ -178,6 +185,9 @@ class PatchDataset(Dataset):
+     def __getitem__(self, idx):
+         img = to_tensor(Image.open(self.img_paths[idx]).convert("RGB"))
+         coords, X, patch_genes = self.load_cells(idx)
++        _, provided_idx = self._get_gene_mapping(patch_genes)
++        target_available = torch.zeros(self.n_genes, dtype=torch.bool)
++        target_available[provided_idx] = True
+         n_cells = coords.shape[0]
+ 
+         if self.max_cells_per_patch is not None and n_cells > self.max_cells_per_patch:
+@@ -198,12 +208,12 @@ class PatchDataset(Dataset):
+ 
+         rel_xy = torch.from_numpy(coords)
+         if self.augment:
+-            img, rel_xy = augment_image_and_positions(img, rel_xy, self.img_size)
+-
++            img, rel_xy, _ = augment_image_and_positions(img, rel_xy, self.img_size)
+         return {
+-            "img": img,
++                "img": img,
+             "cell_xy": rel_xy,
+             "genes_target": genes_target,
++            "target_available": target_available,
+             "S_genes": self.union_genes,
+             "n_cells": n_cells,
+             "patient": self.patients[idx],
+@@ -220,5 +230,5 @@ def build_split_datasets(config: dict, union_genes: List[str]):
+     for split in ("train", "val", "test"):
+         df = load_patch_index(split=split, **common)
+         out[split] = PatchDataset(df, union_genes, img_size=img_size,
+-                                  max_cells_per_patch=max_cells, augment=(split == "train"))
++                                  max_cells_per_patch=max_cells, augment=(split == "train"), halo_pixels=config.get("halo_pixels",0))
+     return out
+diff --git a/cello/model.py b/cello/model.py
+index df43b2b..dd89334 100644
+--- a/cello/model.py
++++ b/cello/model.py
+@@ -1,26 +1,7 @@
+-"""CELLO: cell-level gene expression prediction from H&E.
+-
+-One pathology-foundation-model (PFM) forward pass per 224x224 tile produces a
+-2-D token map. Each cell is queried at its (sub-token) location by bilinear
+-grid sampling, refined by a distance-decay cross-attention over the tile's
+-tokens, and decoded into a gene-expression vector over a union vocabulary.
+-
+-Two cell-feature modes are provided:
+-
+-* ``cross_attn`` (CELLO, default): grid-sampled query -> cross-attention with
+-  2-D RoPE and a Gaussian distance-decay bias -> LayerNorm -> residual fusion
+-  with the tile CLS token -> gene head.
+-* ``grid`` (the "Grid" baseline of Table 1): grid-sampled raw backbone tokens
+-  fed straight into the gene head, with no projection, attention or CLS fusion.
+-
+-Both modes add an auxiliary patch-level head on the CLS token that predicts the
+-summed expression of all cells in the tile (Eq. 5, lambda = ``l_pg``).
+-
+-The parameter names match the checkpoints used for the paper, so those
+-checkpoints load with ``strict=True`` (see :func:`load_checkpoint`).
+-"""
++"""CASAGE model on the CELLO backbone and benchmark interfaces."""
+ 
+ import math
++import os
+ from typing import Dict, List, Optional
+ 
+ import timm
+@@ -36,6 +17,11 @@ from timm.data import resolve_data_config
+ # ``timm_kwargs`` are the model-card arguments for each backbone. ``patch_size``
+ # and ``num_prefix_tokens`` define the token grid (224 / patch_size per side).
+ ENCODER_REGISTRY = {
++    "h1": {
++        "hub_id": "hf-hub:bioptimus/H-optimus-1",
++        "timm_kwargs": {"init_values": 1e-5, "dynamic_img_size": False},
++        "patch_size": 14,
++    },
+     "virchow2": {
+         "hub_id": "hf-hub:paige-ai/Virchow2",
+         "timm_kwargs": {"mlp_layer": timm.layers.SwiGLUPacked, "act_layer": nn.SiLU},
+@@ -54,12 +40,15 @@ ENCODER_REGISTRY = {
+ }
+ 
+ 
+-def build_encoder(name: str, pretrained: bool = True) -> nn.Module:
++def build_encoder(name: str, pretrained: bool = True, dynamic_img_size: bool = False) -> nn.Module:
+     if name not in ENCODER_REGISTRY:
+         raise ValueError(f"Unknown vision_encoder '{name}'. Choices: {list(ENCODER_REGISTRY)}")
+     cfg = ENCODER_REGISTRY[name]
+-    return timm.create_model(cfg["hub_id"], pretrained=pretrained, num_classes=0,
+-                             **cfg["timm_kwargs"])
++    kwargs = dict(cfg["timm_kwargs"])
++    if dynamic_img_size: kwargs["dynamic_img_size"] = True
++    local_dir = os.environ.get("CASAGE_ENCODER_DIR")
++    source = f"local-dir:{local_dir}" if local_dir else cfg["hub_id"]
++    return timm.create_model(source, pretrained=pretrained, num_classes=0, **kwargs)
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -168,7 +157,7 @@ class CELLO(nn.Module):
+ 
+         # ---- backbone ----
+         self.vision_encoder = self.config.get("vision_encoder", "virchow2")
+-        self.encoder = build_encoder(self.vision_encoder, pretrained=pretrained_encoder)
++        self.encoder = build_encoder(self.vision_encoder, pretrained=pretrained_encoder, dynamic_img_size=self.config.get("dynamic_encoder",False))
+         self.backbone_dim = self.encoder.embed_dim
+         self.patch_size = ENCODER_REGISTRY[self.vision_encoder]["patch_size"]
+         self.token_grid = self.img_size // self.patch_size
+@@ -195,7 +184,13 @@ class CELLO(nn.Module):
+             head_dim = self.backbone_dim
+         self.cell_gene = GeneHead(head_dim, 512, n_genes)
+         self.cls_gene = GeneHead(head_dim, 512, n_genes)
++        if self.cell_feature_mode == 'grid':
++            from .grid_variant_features import AdaptiveGrid
++            self.grid_adapter = AdaptiveGrid(self.backbone_dim)
+ 
++        if self.config.get('cls_objective') == 'distribution':
++            with torch.random.fork_rng(devices=[]):
++                self.cls_detection = nn.Linear(self.cls_gene.fc[-1].in_features, n_genes)
+         # Token-grid positions (x, y) in row-major token order.
+         xs = torch.arange(self.token_grid)
+         ys = torch.arange(self.token_grid)
+@@ -209,53 +204,68 @@ class CELLO(nn.Module):
+ 
+     # ------------------------------------------------------------------
+     def _cell_features(self, all_cell_xy, tokens_batch, cell_counts):
+-        """Grid-sample one query per cell, then (CELLO) refine it by cross-attention."""
+-        device = all_cell_xy.device
+-        B = tokens_batch.shape[0]
+-        dim = tokens_batch.shape[-1]
+-        cell_patch_idx = torch.repeat_interleave(
+-            torch.arange(B, device=device), torch.tensor(cell_counts, device=device))
+-
+-        cell_tokens = tokens_batch[cell_patch_idx]                        # (N, M, C)
+-        cell_feats = cell_tokens.view(-1, self.token_grid, self.token_grid, dim).permute(0, 3, 1, 2)
+-
+-        # Eq. 2: patch-local pixel coordinates -> [-1, 1].
+-        gx = (all_cell_xy[:, 0] / self.img_size) * 2 - 1
+-        gy = (all_cell_xy[:, 1] / self.img_size) * 2 - 1
+-        grid = torch.stack([gx, gy], dim=-1).view(-1, 1, 1, 2)
+-        q0 = F.grid_sample(cell_feats, grid, mode="bilinear",
+-                           align_corners=True).squeeze(-1).squeeze(-1)   # Eq. 3
+-
+-        if self.cell_feature_mode == "grid":
+-            return q0
+-
+-        bias = None
+-        if self.use_distance_bias:                                        # Eq. 4
+-            token_centers = (self.pos_tokens.float() + 0.5) * self.patch_size
+-            diff = token_centers.unsqueeze(0) - all_cell_xy.unsqueeze(1)
+-            bias = (-(diff ** 2).sum(-1) / (2.0 * self.patch_size ** 2)).clamp(min=-20.0)
+-
+-        z = self.cross(q0, cell_tokens, self.pos_tokens, bias)
+-        return self.cell_norm(z)
++        from .grid_variant_features import sample_points
++        maps=tokens_batch.transpose(1,2).reshape(len(cell_counts),-1,self.token_grid,self.token_grid)
++        q0=sample_points(maps,all_cell_xy[:,None,:],cell_counts).squeeze(1)
++        if self.cell_feature_mode=='grid':return q0
++        # K/V affine projections are identical for every cell in a tile: compute once.
++        h,dh=self.cross.h,self.cross.dh;B,M,_=tokens_batch.shape
++        q=self.cross.q(q0).view(len(q0),h,dh)
++        k=self.cross.k(tokens_batch).view(B,M,h,dh).transpose(1,2)
++        v=self.cross.v(tokens_batch).view(B,M,h,dh).transpose(1,2)
++        q,k=apply_rope_2d(q,k,self.pos_tokens.float().mean(0).to(q.device),self.pos_tokens.to(q.device))
++        def attend(qt,kt,vt,bias):
++            score=torch.einsum('nhd,hmd->nhm',qt,kt)/math.sqrt(dh)
++            if bias is not None:score=score+bias[:,None]
++            weights=self.cross.dropout(F.softmax(score,dim=-1))
++            ctx=torch.einsum('nhm,hmd->nhd',weights,vt)
++            return self.cross.o(ctx.reshape(len(qt),self.d))
++        result=[];start=0
++        for b,count in enumerate(cell_counts):
++            if count:
++                centers=(self.pos_tokens.float()+.5)*self.patch_size
++                bias=(-((centers[None]-all_cell_xy[start:start+count,None])**2).sum(-1)/(2*self.patch_size**2)).clamp(min=-20.) if self.use_distance_bias else None
++                args=(q[start:start+count],k[b],v[b],bias)
++                if self.training and self.config.get('cross_attention_checkpointing',False):
++                    from torch.utils.checkpoint import checkpoint
++                    value=checkpoint(attend,*args,use_reentrant=False,preserve_rng_state=True)
++                else:value=attend(*args)
++                result.append(value)
++            start+=count
++        return self.cell_norm(torch.cat(result))
+ 
+-    # ------------------------------------------------------------------
+     @staticmethod
+     def _unpack_cells(batch_data, device):
+-        cell_xy_pad = batch_data["cell_xy"].to(device)            # (B, max_n, 2)
+-        genes_target_pad = batch_data["genes_target"].to(device)  # (B, max_n, G)
+-        cell_mask = batch_data["cell_mask"].to(device)            # (B, max_n)
++        cell_xy_pad = batch_data["cell_xy"].to(device, non_blocking=True)            # (B, max_n, 2)
++        genes_target_pad = batch_data["genes_target"].to(device, non_blocking=True)  # (B, max_n, G)
++        cell_mask = batch_data["cell_mask"].to(device, non_blocking=True)            # (B, max_n)
+         cell_counts = [int(c) for c in batch_data["n_cells"]]
+         return cell_xy_pad[cell_mask], genes_target_pad[cell_mask], cell_counts
+ 
+     # ------------------------------------------------------------------
++    def _global_exists(self,values):
++        v=values.float().sum(0).detach()
++        if self.training and torch.distributed.is_initialized() and torch.distributed.get_world_size()>1:
++            torch.distributed.all_reduce(v)
++        return v>0
++
++    def _global_mean(self,values):
++        denom=torch.tensor(values.numel(),device=values.device,dtype=torch.float32)
++        world=1
++        if self.training and torch.distributed.is_initialized() and torch.distributed.get_world_size()>1:
++            world=torch.distributed.get_world_size()
++            torch.distributed.all_reduce(denom)
++        return values.float().sum()*world/denom.clamp_min(1)
++
+     def forward_batch(self, batch_data: Dict, union_index_map: Dict[str, int],
+                       compute_preds: bool = False) -> Dict:
+         device = self.pos_tokens.device
+-        imgs = batch_data["img"].to(device)
++        imgs = batch_data["img"].to(device, non_blocking=True)
+         B = imgs.shape[0]
+ 
+         # 1. backbone (one forward pass per tile)
+         x = (imgs - self.mean) / (self.std + 1e-6)
++        self.encoder.set_grad_checkpointing(bool(self.config.get('encoder_gradient_checkpointing',False) and self.training and torch.is_grad_enabled() and self.encoder.patch_embed.proj.weight.requires_grad))
+         feats = self.encoder.forward_features(x)                  # (B, prefix + M, C)
+         if self.cell_feature_mode == "cross_attn":
+             feats = self.backbone_proj(feats)
+@@ -274,6 +284,9 @@ class CELLO(nn.Module):
+         # 2. cell features
+         z_cells = self._cell_features(all_cell_xy, tokens_batch, cell_counts)
+ 
++        if self.cell_feature_mode == 'grid' and self.config.get('adaptive_enabled', True):
++            z_cells = self.grid_adapter(z_cells, all_cell_xy, tokens_batch, cell_counts)
++
+         # 3. residual fusion with the tile CLS token (CELLO only)
+         if self.cell_feature_mode == "cross_attn":
+             cell_patch_idx = torch.repeat_interleave(
+@@ -283,33 +296,80 @@ class CELLO(nn.Module):
+             z_cells = self.cls_layer_norm(z_cells + attn_out.squeeze(1))
+ 
+         # 4. cell-level gene prediction + loss over genes measured in this batch
+-        union_logits = self.cell_gene(z_cells)
++        raw_gene_logits = None
++        if self.training:
++            assert self.config.get('positive_count_recovery', False)
++            raw_gene_logits = self.cell_gene.fc(z_cells)
++            union_logits = raw_gene_logits
++        else:
++            union_logits = self.cell_gene(z_cells)
+         main_S_genes = batch_data["S_genes"]
+         total_l_gene = torch.tensor(0., device=device)
+         total_l_pg = torch.tensor(0., device=device)
++        total_l_within = z_cells.sum()*0.
+         pred_S_all = torch.zeros(0, 0, device=device)
+ 
+         if main_S_genes:
+             idxs = torch.tensor([union_index_map[g] for g in main_S_genes],
+                                 dtype=torch.long, device=device)
+             pred_S_all = union_logits[:, idxs]
+-            gene_exists = (all_genes_target.sum(0) > 0)
++            use_table_mask = self.config.get('provided_target_table_mask',False)
++            if use_table_mask:
++                from .target_availability import available_for_loss
++                provided_cells,provided_patches=available_for_loss(batch_data,cell_counts,idxs,device)
++                if self.training:assert bool((all_genes_target[~provided_cells]==0).all()), 'Availability mapping drops a positive label'
++            gene_exists = (self._global_exists(all_genes_target)
++                           if self.config.get('global_nonzero_gene_filter', True)
++                           else torch.ones(all_genes_target.shape[1], device=device, dtype=torch.bool))
+             if gene_exists.sum() > 0:
+                 mask = gene_exists.unsqueeze(0).expand_as(pred_S_all)
+-                total_l_gene = F.huber_loss(
+-                    pred_S_all[mask], all_genes_target[mask], delta=1.0).mean()
+-
+-            # 5. patch-level auxiliary loss: CLS -> sum of cell expressions in the tile
+-            cls_S = self.cls_gene(cls_batch)[:, idxs]
+-            patch_targets = torch.zeros(B, len(main_S_genes), device=device)
+-            s = 0
+-            for b in range(B):
+-                if cell_counts[b] > 0:
+-                    patch_targets[b] = all_genes_target[s:s + cell_counts[b]].sum(0)
+-                s += cell_counts[b]
+-            pe = (patch_targets.sum(0) > 0)
+-            if pe.sum() > 0:
+-                total_l_pg = F.huber_loss(cls_S[:, pe], patch_targets[:, pe], delta=1.0).mean()
++                if use_table_mask:mask = mask & provided_cells
++                prediction = pred_S_all[mask]
++                target = all_genes_target[mask]
++                if self.training:
++                    from .positive_recovery import positive_recovery_errors
++                    errors = positive_recovery_errors(prediction, target)
++                    if getattr(self,'capture_recovery_diagnostics',False):
++                        self.last_positive_recovery_diagnostics = dict(
++                            scope='raw-output Huber over valid cell--gene pairs',
++                            masked_elements=prediction.numel(),
++                            positive_elements=int((target>0).sum()),
++                            effective_cell_error_mean_local=float(errors.detach().mean()),
++                        )
++                else:
++                    errors = F.huber_loss(prediction, target, delta=1.0, reduction='none')
++                total_l_gene = self._global_mean(errors)
++
++            if self.training and self.config.get('cls_objective') == 'distribution':
++                from .cls_distribution import targets, terms
++                target_sums, fraction, positive_mean, has_positive = targets(all_genes_target, cell_counts)
++                nonempty_tiles = torch.as_tensor(cell_counts, device=device) > 0
++                available = nonempty_tiles[:, None] & provided_patches
++                hidden = self.cls_gene.fc[:-1](cls_batch)
++                prevalence_logits = self.cls_detection(hidden)[:, idxs]
++                intensity_logits = self.cls_gene.fc[-1](hidden)[:, idxs]
++                detection, intensity = terms(
++                    prevalence_logits, intensity_logits, fraction, positive_mean, available, has_positive,
++                )
++                distribution_loss = .5 * (self._global_mean(detection) + self._global_mean(intensity))
++                counts = torch.as_tensor(cell_counts, device=device).clamp_min(1)
++                target_means = target_sums / counts[:, None]
++                predicted_means = prevalence_logits.float().sigmoid() * F.softplus(intensity_logits.float())
++                mean_errors = F.huber_loss(predicted_means[available], target_means[available],
++                                           delta=1.0, reduction='none')
++                total_l_pg = .5 * (distribution_loss + self._global_mean(mean_errors))
++
++            # Independent loss-only auxiliary; prediction graph and base losses unchanged.
++            aux_mode = self.config.get('within_tile_aux_mode', 'none')
++            if self.training and aux_mode != 'none':
++                from .within_tile_aux import auxiliary_values
++                aux_mask = mask
++                assert raw_gene_logits is not None, 'Raw REP requires the raw-output training path'
++                aux_values = auxiliary_values(raw_gene_logits[:, idxs], all_genes_target, aux_mask, cell_counts, aux_mode)
++                total_l_within = self._global_mean(aux_values)
++                total_l_gene = total_l_gene + self.config['within_tile_aux_coefficient']*total_l_within
++                if getattr(self,'capture_recovery_diagnostics',False):
++                    self.last_positive_recovery_diagnostics.update(base_Huber_only=True,within_tile_aux_mode=aux_mode,auxiliary_elements_rank_local=aux_values.numel(),auxiliary_DDP_scaled_term_rank_local=float(total_l_within.detach()))
+ 
+         # 6. per-tile PCC (flattened over measured genes), used for quick monitoring
+         patch_pcc_list = []
+@@ -332,6 +392,7 @@ class CELLO(nn.Module):
+ 
+         return {
+             "l_gene": total_l_gene,
++            "l_within_aux": total_l_within,
+             "l_pg": total_l_pg,
+             "union_logits": union_logits if compute_preds else None,
+             "patch_pcc_list": patch_pcc_list,
+@@ -409,7 +470,7 @@ def load_checkpoint(path: str, device="cpu", config_overrides: Optional[dict] =
+     return model.to(device).eval(), config, union_genes
+ 
+ 
+-_EMBED_DIM_TO_ENCODER = {1280: "virchow2", 768: "h0_mini", 1024: "uni"}
++_EMBED_DIM_TO_ENCODER = {1280: "virchow2", 768: "h0_mini", 1024: "uni", 1536: "h1"}
+ 
+ 
+ def _infer_legacy_config(config, state):
+diff --git a/scripts/evaluate.py b/scripts/evaluate.py
+index 4347146..1b3b523 100644
+--- a/scripts/evaluate.py
++++ b/scripts/evaluate.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python
+-"""Evaluate a CELLO checkpoint on the test (or val) slides.
++"""Evaluate a CASAGE checkpoint on the test (or val) slides.
+ 
+ Every cell of every tile is predicted and compared with its measured
+ expression. Per slide we report the gene-wise PCC averaged over all measured
+@@ -80,6 +80,10 @@ def main():
+     k_values = [int(k) for k in args.k.split(",")]
+     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+     model, config, union_genes = load_checkpoint(args.checkpoint, device)
++    assert all(torch.isfinite(p).all() for p in model.parameters()), "nonfinite model"
++    if config.get("channels_last"):
++        model.to(memory_format=torch.channels_last)
++        torch.backends.cudnn.benchmark=True
+     union_map = {g: i for i, g in enumerate(union_genes)}
+     print(f"Loaded {args.checkpoint}: encoder={config.get('vision_encoder')}, "
+           f"mode={config.get('cell_feature_mode', 'cross_attn')}, {len(union_genes)} genes")
+@@ -88,7 +92,7 @@ def main():
+     df = load_patch_index(index_csv, args.split_csv, None if args.patients else args.split,
+                           data_root=args.data_root, patients=args.patients)
+     ds = PatchDataset(df, union_genes, img_size=config.get("img_size", 224),
+-                      max_cells_per_patch=config.get("max_cells_per_patch", 256), augment=False)
++                      max_cells_per_patch=config.get("max_cells_per_patch", 256), augment=False, halo_pixels=config.get("halo_pixels",0))
+     groups = slide_indices(ds)
+     print(f"{len(ds)} tiles from {len(groups)} slides")
+ 
+diff --git a/scripts/train.py b/scripts/train.py
+index f95cdcd..8a46d19 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -1,21 +1,8 @@
+ #!/usr/bin/env python
+-"""Train CELLO on 10X-Xenium-52.
+-
+-One process per visible GPU (``torch.multiprocessing.spawn``). Settings follow
+-Appendix C of the paper: AdamW with separate encoder / head parameter groups,
+-cosine schedule over 200 epochs, fp16 autocast, gradient clipping at 1.0, and a
+-three-phase encoder schedule (frozen for the first 10% of epochs, linear LR
+-warm-up to ``lr_encoder_max`` over the next 30%, fully fine-tuned afterwards).
+-Validation runs at epoch 0 and every 5 epochs on rank 0; the checkpoint with
+-the highest mean gene-wise PCC over the validation slides is kept.
+-
+-Example:
+-    CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/train.py --config configs/cello_virchow2.yaml \
+-        --data_root data/xenium52 --output_dir checkpoints/cello_virchow2
+-"""
+-
++"""Train CASAGE on the 10X-Xenium-52 benchmark."""
+ import argparse
+ import datetime
++import time
+ import json
+ import logging
+ import os
+@@ -30,7 +17,6 @@ import torch.multiprocessing as mp
+ import yaml
+ from torch.nn.parallel import DistributedDataParallel as DDP
+ from torch.utils.data import DataLoader
+-from torch.utils.data.distributed import DistributedSampler
+ 
+ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+ from cello.dataset import build_split_datasets, collate_fn, read_gene_vocab  # noqa: E402
+@@ -102,6 +88,9 @@ def find_free_port():
+ 
+ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_pcc, config, union_genes):
+     torch.save({
++        "rng_state": {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all()},
++        "scaler_state_dict": _CURRENT_SCALER.state_dict(),
++        "budget": {"virtual_world_size": config["virtual_world_size"], "rank": 0, "completed_virtual_epochs": epoch+1, "completed_full_epochs": epoch+1, "legacy_completed_full_epochs": config["legacy_completed_full_epochs"]},
+         "epoch": epoch,
+         "model_state_dict": model.state_dict(),
+         "optimizer_state_dict": optimizer.state_dict(),
+@@ -109,7 +98,8 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_pcc, config,
+         "best_pcc": best_pcc,
+         "config": config,
+         "union_genes": union_genes,
+-    }, path)
++    }, path + ".tmp")
++    os.replace(path + ".tmp", path)
+ 
+ 
+ def set_encoder_trainable(model, flag):
+@@ -136,14 +126,17 @@ def train_worker(rank, world_size, config):
+     log.info(f"tiles: train {len(ds_train)}, val {len(ds_val)}; genes {len(union_genes)}")
+ 
+     bs = config["batch_size_per_gpu"]
+-    sampler = DistributedSampler(ds_train, num_replicas=world_size, rank=rank, shuffle=True)
+-    loader = DataLoader(ds_train, batch_size=bs, sampler=sampler, num_workers=config["num_workers"],
+-                        pin_memory=True, collate_fn=collate_fn, persistent_workers=True,
+-                        prefetch_factor=4)
++    from cello.full_ddp_sampler import FullBatchShard
++    sampler = FullBatchShard(len(ds_train),rank,world_size,world_size * bs)
++    loader = DataLoader(ds_train,batch_sampler=sampler,num_workers=config['num_workers'],pin_memory=True,collate_fn=collate_fn,persistent_workers=config["num_workers"] > 0,
++                        prefetch_factor=4 if config["num_workers"] > 0 else None)
+     log.info(f"batch size {bs} per GPU x {world_size} GPUs")
+ 
+     # ---- model ----
+     model = CELLO(union_genes, config).to(device)
++    if config.get("channels_last"):
++        model.to(memory_format=torch.channels_last)
++        torch.backends.cudnn.benchmark = True
+     log.info(f"parameters: {sum(p.numel() for p in model.parameters()):,}")
+ 
+     start_epoch, best_pcc = 0, 0.0
+@@ -168,12 +161,21 @@ def train_worker(rank, world_size, config):
+         {"params": enc_params, "lr": config["lr_encoder"], "weight_decay": config["weight_decay_encoder"]},
+         {"params": head_params, "lr": config["lr_head"], "weight_decay": config["weight_decay_head"]},
+     ])
++    global _CURRENT_SCALER
+     scaler = torch.amp.GradScaler("cuda")
++    _CURRENT_SCALER = scaler
+     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"], eta_min=1e-8)
+     if ckpt is not None:
+         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
++        if "scaler_state_dict" in ckpt: scaler.load_state_dict(ckpt["scaler_state_dict"])
++        # Restore each rank's saved main-process state. Persistent DataLoader
++        # worker RNG was not saved; this limitation is recorded in migration.
++        rs=torch.load(os.path.join(config['output_dir'],f'rng_rank{rank}.pt'),map_location='cpu',weights_only=False)
++        assert rs['epoch']==start_epoch-1
++        random.setstate(rs['python']);np.random.set_state(rs['numpy']);torch.set_rng_state(rs['torch'].cpu());torch.cuda.set_rng_state(rs['cuda'].cpu(),device=device);scaler.load_state_dict(rs['scaler'])
+         del ckpt
++        torch.cuda.empty_cache()
+ 
+     E = config["epochs"]
+     freeze_epochs = int(E * config["freeze_encoder_ratio"])
+@@ -181,7 +183,14 @@ def train_worker(rank, world_size, config):
+     log.info(f"encoder schedule: frozen <= epoch {freeze_epochs}, warm-up for {warm_epochs} epochs, "
+              f"then lr {config['lr_encoder_max']:.1e}; gradient sync: {config['grad_sync']}")
+ 
+-    for epoch in range(start_epoch, E):
++    encoder_anchor=net.encoder.patch_embed.proj.weight.detach().clone()
++    consecutive_overflows=0
++    for epoch in range(start_epoch, min(E, config.get("stop_after_full_epochs", E))):
++        epoch_tiles = 0
++        epoch_cells = 0
++        epoch_steps = 0
++        epoch_successful_updates=0
++        epoch_overflows=0
+         ddp.train()
+         sampler.set_epoch(epoch)
+         if epoch <= freeze_epochs:
+@@ -195,33 +204,89 @@ def train_worker(rank, world_size, config):
+             set_encoder_trainable(net, True)
+             optimizer.param_groups[0]["lr"] = config["lr_encoder_max"]
+ 
++        window_start=time.perf_counter()
++        epoch_train_start=window_start
+         for step, batch in enumerate(loader):
++            epoch_tiles += int(batch["img"].shape[0])
++            epoch_cells += sum(batch["n_cells"])
++            epoch_steps += 1
++            net.capture_recovery_diagnostics=(rank==0 and (step+1)%100==0)
+             with torch.amp.autocast("cuda"):
+                 out = ddp(batch, union_map) if sync else net.forward_batch(batch, union_map)
+                 loss = config["l_gene"] * out["l_gene"] + config["l_pg"] * out["l_pg"]
++            assert torch.isfinite(loss), "training loss nonfinite"
+             optimizer.zero_grad()
+             scaler.scale(loss).backward()
+             scaler.unscale_(optimizer)
+-            torch.nn.utils.clip_grad_norm_(ddp.parameters(), config["grad_clip"])
++            grad_norm=torch.nn.utils.clip_grad_norm_(ddp.parameters(), config["grad_clip"])
++            scale_before=float(scaler.get_scale())
++            overflow=not bool(torch.isfinite(grad_norm))
++            # unscale_ recorded found_inf before clipping; step must skip if
++            # overflow occurred. Never call optimizer.step directly in this path.
+             scaler.step(optimizer)
+             scaler.update()
++            if overflow:
++                consecutive_overflows+=1;epoch_overflows+=1
++                scale_after=float(scaler.get_scale())
++                assert scale_after<scale_before and scale_after>0, "AMP failed to back off"
++                assert all(torch.isfinite(p).all() for p in net.parameters()), "nonfinite parameters after skipped step"
++                assert consecutive_overflows<=32, "persistent gradient overflow"
++                event=dict(epoch_zero_based=epoch,batch_one_based=step+1,scale_before=scale_before,scale_after=scale_after,loss=float(loss.detach()),optimizer_update_skipped=True,parameters_finite=True)
++                if rank==0:
++                    with open(os.path.join(config['output_dir'],'AMP_OVERFLOW_EVENTS.jsonl'),'a') as f:f.write(json.dumps(event)+chr(10))
++                log.warning('AMP_SKIPPED_UPDATE '+json.dumps(event))
++            else:
++                consecutive_overflows=0;epoch_successful_updates+=1
+             if rank == 0 and (step + 1) % 100 == 0:
+                 log.info(f"epoch {epoch} step {step + 1}: loss {loss.item():.4f} "
+                          f"(cell {out['l_gene'].item():.4f}, patch {out['l_pg'].item():.4f}) "
+                          f"lr enc {optimizer.param_groups[0]['lr']:.2e} head {optimizer.param_groups[1]['lr']:.2e}")
+ 
++                with open(os.path.join(config['output_dir'],'POSITIVE_RECOVERY_DIAGNOSTICS.jsonl'),'a') as pf:
++                    pf.write(json.dumps(dict(epoch_zero_based=epoch,batch_one_based=step+1,**net.last_positive_recovery_diagnostics))+chr(10))
++                now=time.perf_counter()
++                with open(os.path.join(config['output_dir'],'THROUGHPUT.jsonl'),'a') as tf:
++                    tf.write(json.dumps(dict(epoch_zero_based=epoch,end_step=step+1,window_steps=100,global_batch=world_size * bs,tiles=100 * world_size * bs,seconds=now-window_start,tiles_per_second=100 * world_size * bs/(now-window_start),phase='frozen' if epoch<=freeze_epochs else 'finetuning',first_window_includes_loader_start=(step==99)))+chr(10))
++                window_start=now
++        if rank==0:
++            with open(os.path.join(config['output_dir'],'EPOCH_TRAIN_TIMING.jsonl'),'a') as tf:
++                tf.write(json.dumps(dict(epoch_zero_based=epoch,seconds=time.perf_counter()-epoch_train_start,optimizer_batches=epoch_steps,global_batch=world_size * bs,excludes_validation=True))+chr(10))
++
+         if epoch == 0 or (epoch + 1) % config["val_every"] == 0:
+-            if rank == 0:
+-                val_pcc, _ = validate_slides(net, ds_val, union_map, device,
+-                                             batch_size=config["val_batch_size"], log=log.info)
++            from cello.dataset import PatchDataset
++            # Balance whole slides using tile counts only; never split a slide
++            # or change its original per-slide inference batches/metric.
++            sizes=ds_val.df.groupby('patient').size().to_dict();groups=[[] for _ in range(world_size)];loads=[0]*world_size
++            for sid in sorted(sizes,key=lambda k:(-sizes[k],str(k))):
++                ri=min(range(world_size),key=lambda k:loads[k]);groups[ri].append(sid);loads[ri]+=sizes[sid]
++            assigned = [sid for group in groups for sid in group]
++            assert len(assigned) == len(set(assigned)) and set(assigned) == set(sizes)
++            val_ds=PatchDataset(ds_val.df[ds_val.df.patient.isin(groups[rank])].reset_index(drop=True),union_genes,img_size=ds_val.img_size,max_cells_per_patch=ds_val.max_cells_per_patch,augment=False,halo_pixels=config.get("halo_pixels",0))
++            _, local_scores=validate_slides(net,val_ds,union_map,device,batch_size=config['val_batch_size'],num_workers=config['num_workers'],log=log.info)
++            gathered=[None for _ in range(world_size)];dist.all_gather_object(gathered,local_scores)
++            per_slide_val={}
++            for rr in gathered:
++                assert not set(per_slide_val)&set(rr);per_slide_val.update(rr)
++            assert len(per_slide_val)==4
++            val_pcc=float(np.mean(list(per_slide_val.values())))
++            if rank==0:
+                 log.info(f"epoch {epoch}: val gene PCC {val_pcc:.4f} (best {best_pcc:.4f})")
+-                if val_pcc > best_pcc:
+-                    best_pcc = val_pcc
+-                    save_checkpoint(os.path.join(config["output_dir"], "best_model.pt"),
+-                                    net, optimizer, scheduler, epoch, best_pcc, config, union_genes)
+-                    log.info(f"new best checkpoint at epoch {epoch}")
+-            if sync:
+-                dist.barrier()
++                with open(os.path.join(config['output_dir'],'validation_history.jsonl'),'a') as vf:
++                    vf.write(json.dumps(dict(epoch_zero_based=epoch,completed_full_epochs=epoch+1,mean_gene_pcc=val_pcc,per_slide=per_slide_val,whole_slide_rank_partition=groups))+chr(10))
++            best_pcc=max(best_pcc,val_pcc)
++            dist.barrier()
++        totals=torch.tensor([epoch_tiles,epoch_cells],device=device,dtype=torch.long)
++        dist.all_reduce(totals)
++        assert int(totals[0]) == len(ds_train) and epoch_steps == len(sampler)
++        led=torch.tensor([epoch_successful_updates,epoch_overflows],device=device)
++        other=[torch.empty_like(led) for _ in range(world_size)];dist.all_gather(other,led);assert all(torch.equal(other[0], item) for item in other)
++        if rank==0:
++            with open(os.path.join(config['output_dir'],'full_epoch_exposure.jsonl'),'a') as f:
++                f.write(json.dumps(dict(completed_full_epochs=epoch+1,tiles=int(totals[0]),cells=int(totals[1]),optimizer_batches=epoch_steps,successful_optimizer_updates=epoch_successful_updates,amp_skipped_updates=epoch_overflows,sampler_replicas=world_size,global_batch=world_size * bs,seed=0,no_duplicate_padding=True))+chr(10))
++            with torch.no_grad():relative_drift=float((net.encoder.patch_embed.proj.weight-encoder_anchor).norm()/encoder_anchor.norm().clamp_min(1e-12))
++            with open(os.path.join(config['output_dir'],'ENCODER_DRIFT.jsonl'),'a') as f:f.write(json.dumps(dict(completed_full_epochs=epoch+1,relative_patch_embedding_weight_drift=relative_drift,encoder_lr=optimizer.param_groups[0]['lr'],head_lr=optimizer.param_groups[1]['lr']))+chr(10))
++        torch.save(dict(epoch=epoch,python=random.getstate(),numpy=np.random.get_state(),torch=torch.get_rng_state(),cuda=torch.cuda.get_rng_state(),scaler=scaler.state_dict()),os.path.join(config['output_dir'],f'rng_rank{rank}.pt.tmp'))
++        os.replace(os.path.join(config['output_dir'],f'rng_rank{rank}.pt.tmp'),os.path.join(config['output_dir'],f'rng_rank{rank}.pt'))
+         scheduler.step()
+         # Saved after validation and the LR step, so a resumed run continues with the
+         # current best score and the learning rate of the next epoch.
+@@ -230,13 +295,14 @@ def train_worker(rank, world_size, config):
+ 
+     if rank == 0:
+         log.info("training finished")
++    dist.barrier()
+     dist.destroy_process_group()
+ 
+ 
+ # --------------------------------------------------------------------------
+ def parse_args():
+     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+-    ap.add_argument("--config", default=os.path.join(REPO, "configs", "cello_virchow2.yaml"))
++    ap.add_argument("--config", default=os.path.abspath(os.path.join(REPO, "..", "configs", "casage_virchow2.yaml")))
+     ap.add_argument("--data_root")
+     ap.add_argument("--output_dir")
+     ap.add_argument("--vision_encoder", choices=["virchow2", "h0_mini", "uni"])
+@@ -274,6 +340,8 @@ def main():
+     world_size = torch.cuda.device_count()
+     if world_size == 0:
+         raise SystemExit("CUDA GPUs are required for training")
++    if world_size != 2 or config["batch_size_per_gpu"] != 128 or config["grad_sync"] != "allreduce":
++        raise SystemExit("The benchmark configuration requires two visible GPUs, 128 tiles per GPU, and allreduce.")
+     os.makedirs(config["output_dir"], exist_ok=True)
+     with open(os.path.join(config["output_dir"], "config.json"), "w") as f:
+         json.dump(config, f, indent=2)
